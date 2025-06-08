@@ -1,13 +1,14 @@
-from pathlib import Path
 import sys
 
+from configmypy import ConfigPipeline, YamlConfig, ArgparseConfig
+from pathlib import Path
 import torch
 
 from torch.utils.data import DataLoader, DistributedSampler
 import wandb
 
 from neuralop import H1Loss, LpLoss, Trainer, get_model
-from neuralop.data.datasets import load_darcy_flow_small
+from neuralop.data.datasets.the_well_dataset import MHD64Dataset
 from neuralop.data.transforms.data_processors import MGPatchingDataProcessor
 from neuralop.training import setup, AdamW
 from neuralop.mpu.comm import get_local_rank
@@ -15,14 +16,16 @@ from neuralop.utils import get_wandb_api_key, count_model_params
 
 
 # Read the configuration
-from zencfg import ConfigBase, cfg_from_commandline
+config_name = "default"
+# Read the configuration
+from zencfg import cfg_from_commandline, cfg_from_nested_dict
 import sys 
 sys.path.insert(0, '../')
-from config.darcy_config import Default
-
+from config.the_well.mhd_64_config import Default
 
 config = cfg_from_commandline(Default)
 config = config.to_dict()
+
 
 # Set-up distributed communication, if using
 device, is_logger = setup(config)
@@ -60,29 +63,32 @@ config.verbose = config.verbose and is_logger
 
 # Print config to screen
 if config.verbose and is_logger:
-    print(f"##### CONFIG #####\n")
-    print(config)
+    print(f"##### CONFIG #####\n\n{config}\n")
     sys.stdout.flush()
 
 # Loading the Darcy flow dataset
-data_root = Path(config.data.folder).expanduser()
-train_loader, test_loaders, data_processor = load_darcy_flow_small(
-    data_root=data_root,
-    n_train=config.data.n_train,
-    batch_size=config.data.batch_size,
-    test_resolutions=config.data.test_resolutions,
-    n_tests=config.data.n_tests,
-    test_batch_sizes=config.data.test_batch_sizes,
-    encode_input=False,
-    encode_output=False,
-)
+dataset = MHD64Dataset(root_dir=Path(config.data.root).expanduser(),
+                              train_task='next_step',
+                              eval_tasks=['next_step', 'autoregression'],
+                              first_only=True)
+
+print(dataset.train_db.metadata.n_steps_per_trajectory)
+train_loader = DataLoader(dataset.train_db, batch_size=config.data.batch_size)
+
+test_loaders = {}
+for mode, db in dataset.test_dbs.items():
+    test_loaders[mode] = DataLoader(db, batch_size=config.data.test_batch_size)
+
+data_processor = dataset.data_processor
+print(data_processor)
+
 model = get_model(config)
 
 # convert dataprocessor to an MGPatchingDataprocessor if patching levels > 0
 if config.patching.levels > 0:
     data_processor = MGPatchingDataProcessor(model=model,
-                                             in_normalizer=data_processor.in_normalizer,
-                                             out_normalizer=data_processor.out_normalizer,
+                                             in_normalizer=data_processor.normalizer,
+                                             out_normalizer=data_processor.normalizer,
                                              padding_fraction=config.patching.padding,
                                              stitching=config.patching.stitching,
                                              levels=config.patching.levels,
@@ -91,10 +97,9 @@ if config.patching.levels > 0:
 
 # Reconfigure DataLoaders to use a DistributedSampler 
 # if in distributed data parallel mode
-if config.distributed.use_distributed:
-    train_db = train_loader.dataset
-    train_sampler = DistributedSampler(train_db, rank=get_local_rank())
-    train_loader = DataLoader(dataset=train_db,
+'''if config.distributed.use_distributed:
+    train_sampler = DistributedSampler(dataset.train_db, rank=get_local_rank())
+    train_loader = DataLoader(dataset=dataset.train_db,
                               batch_size=config.data.batch_size,
                               sampler=train_sampler)
     for (res, loader), batch_size in zip(test_loaders.items(), config.data.test_batch_sizes):
@@ -104,7 +109,7 @@ if config.distributed.use_distributed:
         test_loaders[res] = DataLoader(dataset=test_db,
                               batch_size=batch_size,
                               shuffle=False,
-                              sampler=test_sampler)
+                              sampler=test_sampler)'''
 # Create the optimizer
 optimizer = AdamW(
     model.parameters(),
@@ -132,8 +137,8 @@ else:
 
 
 # Creating the losses
-l2loss = LpLoss(d=2, p=2)
-h1loss = H1Loss(d=2)
+l2loss = LpLoss(d=3, p=2)
+h1loss = H1Loss(d=3)
 if config.opt.training_loss == "l2":
     train_loss = l2loss
 elif config.opt.training_loss == "h1":
@@ -189,12 +194,12 @@ if is_logger:
 trainer.train(
     train_loader=train_loader,
     test_loaders=test_loaders,
+    eval_modes={'autoregression': 'autoregression'},
     optimizer=optimizer,
     scheduler=scheduler,
     regularizer=False,
     training_loss=train_loss,
     eval_losses=eval_losses,
 )
-
 if config.wandb.log and is_logger:
     wandb.finish()
